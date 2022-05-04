@@ -5,8 +5,12 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
 #include "libminiasync.h"
 #include "libminiasync/data_mover_threads.h"
+#include "core/os_thread.h"
+#include "core/os.h"
 
 /* Avoid compatibility errors */
 #ifndef _MSC_VER
@@ -33,6 +37,7 @@ bool_compare_and_swap_MSVC(volatile LONG *ptr, LONG oldval, LONG newval)
 	InterlockedExchangeAdd((LONG *)(ptr), -value)
 #endif
 
+#define N_THREADS 12
 #define WAIT_FUTURES_MAX 4
 
 /* Polls 'nfuts' number of futures until they complete, makes use of runtime */
@@ -1136,6 +1141,188 @@ print_entry(uint64_t key, void *value, void *arg)
 	printf("key: %" PRIu64 ", value: %s\n", key, (char *)value);
 }
 
+static void *
+thread_routine(void *arg)
+{
+	struct future *fut = (struct future *)arg;
+	while (future_poll(fut, NULL) != FUTURE_STATE_COMPLETE) {
+		_mm_pause();
+	}
+
+	return NULL;
+}
+
+static void
+hashmap_op_multithreaded(struct future **futs, os_thread_t *threads,
+		size_t n_threads)
+{
+	for (size_t i = 0; i < n_threads; i++) {
+		os_thread_create(&threads[i], NULL, thread_routine, futs[i]);
+	}
+}
+
+static void
+hashmap_multithreaded_wait(os_thread_t *threads, size_t n_threads)
+{
+	for (size_t i = 0; i < n_threads; i++) {
+		os_thread_join(&threads[i], NULL);
+	}
+}
+
+static void
+roll_keys(unsigned *seed, uint64_t *keys, size_t n)
+{
+	/*
+	 * Roll 'n' unique keys. We don't want any of the keys that are
+	 * already stored.
+	 */
+	uint64_t *old_keys = malloc(sizeof(uint64_t) * n);
+	memcpy(old_keys, keys, n);
+
+	size_t rolled = 0;
+	while (rolled != n) {
+		/* 1 - 32768 range */
+		keys[rolled] = (uint64_t)os_rand_r(seed) % (1 << 16) + 1;
+
+		for (size_t i = 0; i < n; i++) {
+			if (keys[rolled] == old_keys[i]) {
+				continue;
+			}
+		}
+
+		for (size_t i = 0; i < rolled; i++) {
+			if (keys[rolled] == keys[i]) {
+				continue;
+			}
+		}
+
+		rolled++;
+	}
+
+	free(old_keys);
+}
+
+static int
+multithreaded_proof()
+{
+	char val[] = "Foo";
+
+	struct hashmap *hm = hashmap_new(N_THREADS);
+
+	struct data_mover_threads *dmt = data_mover_threads_default();
+	if (dmt == NULL) {
+		printf("failed to allocate data mover.\n");
+		return 1;
+	}
+
+	struct vdm *tmover = data_mover_threads_get_vdm(dmt);
+
+	struct hashmap_put_fut put_futs[2 * (N_THREADS / 3)];
+	struct hashmap_remove_fut remove_futs[N_THREADS / 3];
+	struct hashmap_get_copy_fut get_futs[N_THREADS / 3];
+
+	struct hashmap_put_output *put_output;
+	struct hashmap_remove_output *remove_output;
+	struct hashmap_get_copy_output *get_copy_output;
+
+	struct future *futs[N_THREADS];
+	os_thread_t threads[N_THREADS];
+
+	unsigned seed = (unsigned)time(NULL);
+
+	uint64_t put_keys[2 * (N_THREADS / 3)];
+	uint64_t remove_keys[N_THREADS / 3];
+	uint64_t get_keys[N_THREADS / 3];
+	roll_keys(&seed, put_keys, 2 * (N_THREADS / 3));
+	memcpy(remove_keys, put_keys, sizeof(uint64_t) * (N_THREADS / 3));
+	memcpy(get_keys, &put_keys[N_THREADS / 3],
+			sizeof(uint64_t) * (N_THREADS / 3));
+
+	/*
+	 * Insert '2 * (N_THREADS / 3)' hashmap entries - 2/3 of the hashmap
+	 * capacity.
+	 */
+	size_t INITIAL_INSERTS = 2 * (N_THREADS / 3);
+	for (size_t i = 0; i < INITIAL_INSERTS; i++) {
+		put_futs[i] =
+			hashmap_put(tmover, hm, put_keys[i], val,
+					strlen(val) + 1);
+		futs[i] = FUTURE_AS_RUNNABLE(&put_futs[i]);
+	}
+
+	hashmap_op_multithreaded(futs, threads, INITIAL_INSERTS);
+	hashmap_multithreaded_wait(threads, INITIAL_INSERTS);
+
+	for (size_t i = 0; i < INITIAL_INSERTS; i++) {
+		put_output = FUTURE_OUTPUT(&put_futs[i]);
+		assert(put_output->value != NULL);
+	}
+
+	printf("Hashmap state after initial %ld inserts:\n", INITIAL_INSERTS);
+	hashmap_foreach(hm, print_entry, NULL);
+
+	/*
+	 * Continously remove, put, and get 1/3 of the hashmap capacity
+	 * hashmap entries.
+	 */
+	size_t multithreaded_iterations = 1024;
+	for (size_t iter = 0; iter < multithreaded_iterations; iter++) {
+		for (size_t i = 0; i < N_THREADS / 3; i++) {
+			remove_futs[i] = hashmap_remove(hm, remove_keys[i]);
+			futs[i] = FUTURE_AS_RUNNABLE(&remove_futs[i]);
+		}
+
+		roll_keys(&seed, put_keys, N_THREADS / 3);
+
+		for (int i = 0; i < N_THREADS / 3; i++) {
+			put_futs[i] = hashmap_put(tmover, hm, put_keys[i], val,
+					strlen(val) + 1);
+			futs[i + (N_THREADS / 3)] =
+					FUTURE_AS_RUNNABLE(&put_futs[i]);
+		}
+
+		char buf[N_THREADS / 3][32];
+		memset(buf, 0, 32 * (N_THREADS / 3));
+
+		for (int i = 0; i < N_THREADS / 3; i++) {
+			get_futs[i] = hashmap_get_copy(tmover, hm, get_keys[i],
+					buf[i], 32);
+			futs[i + 2 * (N_THREADS / 3)] =
+					FUTURE_AS_RUNNABLE(&get_futs[i]);
+		}
+
+		hashmap_op_multithreaded(futs, threads, N_THREADS);
+		hashmap_multithreaded_wait(threads, N_THREADS);
+
+		for (int i = 0; i < N_THREADS / 3; i++) {
+			remove_output = FUTURE_OUTPUT(&remove_futs[i]);
+			assert(remove_output->key != 0);
+
+			put_output = FUTURE_OUTPUT(&put_futs[i]);
+			assert(put_output->value != NULL);
+
+			get_copy_output = FUTURE_OUTPUT(&get_futs[i]);
+			assert(strcmp(buf[i], val) == 0);
+			assert(get_copy_output->value == buf[i]);
+			assert(get_copy_output->size == strlen(val) + 1);
+			assert(get_copy_output->copy_size == strlen(val) + 1);
+		}
+
+		memcpy(remove_keys, get_keys,
+				sizeof(uint64_t) * (N_THREADS / 3));
+		memcpy(get_keys, put_keys, sizeof(uint64_t) * (N_THREADS / 3));
+	}
+
+	printf("Hashmap state after %zu iterations of removing, putting and "\
+			"copying %d entries:\n", multithreaded_iterations,
+			N_THREADS / 3);
+	hashmap_foreach(hm, print_entry, NULL);
+
+	hashmap_delete(hm);
+
+	return 0;
+}
+
 int
 main(void)
 {
@@ -1264,5 +1451,5 @@ main(void)
 	(void) remove_output;
 	(void) get_copy_output;
 
-	return 0;
+	return multithreaded_proof();
 }
