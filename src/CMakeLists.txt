@@ -46,8 +46,9 @@ set(CORE_DEPS ${CORE_DEPS}
 add_library(cores STATIC ${CORE_DEPS})
 add_library(miniasync SHARED ${SOURCES} miniasync.def)
 set_property(TARGET cores PROPERTY POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(miniasync PRIVATE
+target_link_libraries(miniasync PRIVATE	
 	-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/miniasync.map cores)
+target_link_libraries(miniasync PRIVATE ${CMAKE_THREAD_LIBS_INIT})
 
 target_include_directories(miniasync PRIVATE . include)
 target_include_directories(cores PRIVATE . include)
